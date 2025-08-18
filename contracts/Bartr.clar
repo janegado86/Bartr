@@ -14,8 +14,17 @@
 (define-constant err-no-bids (err u112))
 (define-constant err-not-auction-owner (err u113))
 (define-constant err-auction-not-active (err u114))
+(define-constant err-not-verifier (err u115))
+(define-constant err-insufficient-stake (err u116))
+(define-constant err-verification-exists (err u117))
+(define-constant err-verification-expired (err u118))
+(define-constant err-invalid-verifier (err u119))
+(define-constant err-already-verifier (err u120))
 
 (define-data-var next-item-id uint u1)
+(define-data-var next-verification-id uint u1)
+(define-data-var min-verifier-stake uint u1000)
+(define-data-var verification-fee uint u50)
 (define-data-var next-auction-id uint u1)
 (define-data-var next-trade-id uint u1)
 (define-data-var platform-fee uint u100)
@@ -75,6 +84,48 @@
 (define-map auction-bids uint (list 100 {bidder: principal, amount: uint, block-height: uint}))
 (define-map user-auctions principal (list 50 uint))
 (define-map auction-history uint (list 100 {event: (string-ascii 50), user: principal, amount: uint, block: uint}))
+
+(define-map verifiers principal {
+    stake-amount: uint,
+    verification-count: uint,
+    successful-verifications: uint,
+    reputation-score: uint,
+    active-since: uint,
+    is-active: bool,
+    specialization: (string-ascii 100)
+})
+
+(define-map verifications uint {
+    id: uint,
+    item-id: uint,
+    verifier: principal,
+    requester: principal,
+    verification-type: (string-ascii 50),
+    status: (string-ascii 20),
+    result: (string-ascii 20),
+    evidence: (string-ascii 500),
+    fee-paid: uint,
+    created-at: uint,
+    completed-at: (optional uint),
+    expiry-block: uint
+})
+
+(define-map item-certifications uint {
+    item-id: uint,
+    verifier: principal,
+    certification-type: (string-ascii 50),
+    authenticity-score: uint,
+    condition-verified: bool,
+    value-assessment: uint,
+    notes: (string-ascii 300),
+    certified-at: uint,
+    valid-until: uint
+})
+
+(define-map verifier-stakes principal uint)
+(define-map verification-requests uint (list 20 principal))
+(define-map user-verifications principal (list 100 uint))
+(define-map verifier-history principal (list 100 {action: (string-ascii 50), item-id: uint, block: uint}))
 
 (define-public (register-user (username (string-ascii 50)))
     (let ((caller tx-sender))
@@ -395,6 +446,195 @@
         current-block: stacks-block-height
     }))
 
+(define-public (register-verifier (stake-amount uint) (specialization (string-ascii 100)))
+    (let ((caller tx-sender))
+        (asserts! (is-some (map-get? users caller)) err-unauthorized)
+        (asserts! (is-none (map-get? verifiers caller)) err-already-verifier)
+        (asserts! (>= stake-amount (var-get min-verifier-stake)) err-insufficient-stake)
+        (asserts! (> (len specialization) u0) err-invalid-input)
+        
+        (map-set verifiers caller {
+            stake-amount: stake-amount,
+            verification-count: u0,
+            successful-verifications: u0,
+            reputation-score: u100,
+            active-since: stacks-block-height,
+            is-active: true,
+            specialization: specialization
+        })
+        
+        (map-set verifier-stakes caller stake-amount)
+        (ok true)))
+
+(define-public (request-verification (item-id uint) (verification-type (string-ascii 50)) (preferred-verifier (optional principal)))
+    (let ((caller tx-sender)
+          (verification-id (var-get next-verification-id))
+          (item (unwrap! (map-get? items item-id) err-not-found))
+          (fee (var-get verification-fee)))
+        (asserts! (is-some (map-get? users caller)) err-unauthorized)
+        (asserts! (is-eq (get owner item) caller) err-unauthorized)
+        (asserts! (> (len verification-type) u0) err-invalid-input)
+        
+        (if (is-some preferred-verifier)
+            (let ((verifier (unwrap-panic preferred-verifier)))
+                (asserts! (is-some (map-get? verifiers verifier)) err-invalid-verifier)
+                (asserts! (get is-active (unwrap-panic (map-get? verifiers verifier))) err-invalid-verifier))
+            true)
+        
+        (map-set verifications verification-id {
+            id: verification-id,
+            item-id: item-id,
+            verifier: (default-to tx-sender preferred-verifier),
+            requester: caller,
+            verification-type: verification-type,
+            status: "pending",
+            result: "none",
+            evidence: "",
+            fee-paid: fee,
+            created-at: stacks-block-height,
+            completed-at: none,
+            expiry-block: (+ stacks-block-height u720)
+        })
+        
+        (let ((user-verifications-list (default-to (list) (map-get? user-verifications caller))))
+            (map-set user-verifications caller 
+                     (unwrap! (as-max-len? (append user-verifications-list verification-id) u100) err-invalid-input)))
+        
+        (var-set next-verification-id (+ verification-id u1))
+        (ok verification-id)))
+
+(define-public (accept-verification (verification-id uint))
+    (let ((verification (unwrap! (map-get? verifications verification-id) err-not-found))
+          (caller tx-sender))
+        (asserts! (is-some (map-get? verifiers caller)) err-not-verifier)
+        (asserts! (get is-active (unwrap-panic (map-get? verifiers caller))) err-not-verifier)
+        (asserts! (is-eq (get status verification) "pending") err-invalid-input)
+        (asserts! (< stacks-block-height (get expiry-block verification)) err-verification-expired)
+        
+        (map-set verifications verification-id (merge verification {
+            verifier: caller,
+            status: "accepted"
+        }))
+        (ok true)))
+
+(define-public (complete-verification (verification-id uint) (result (string-ascii 20)) (evidence (string-ascii 500)))
+    (let ((verification (unwrap! (map-get? verifications verification-id) err-not-found))
+          (caller tx-sender))
+        (asserts! (is-eq (get verifier verification) caller) err-unauthorized)
+        (asserts! (is-eq (get status verification) "accepted") err-invalid-input)
+        (asserts! (> (len result) u0) err-invalid-input)
+        
+        (map-set verifications verification-id (merge verification {
+            status: "completed",
+            result: result,
+            evidence: evidence,
+            completed-at: (some stacks-block-height)
+        }))
+        
+        (let ((verifier-data (unwrap! (map-get? verifiers caller) err-not-found)))
+            (map-set verifiers caller (merge verifier-data {
+                verification-count: (+ (get verification-count verifier-data) u1),
+                successful-verifications: (if (is-eq result "verified") 
+                                             (+ (get successful-verifications verifier-data) u1)
+                                             (get successful-verifications verifier-data))
+            })))
+        
+        (let ((verifier-history-list (default-to (list) (map-get? verifier-history caller)))
+              (new-action {action: "verification-completed", item-id: (get item-id verification), block: stacks-block-height}))
+            (map-set verifier-history caller 
+                     (unwrap! (as-max-len? (append verifier-history-list new-action) u100) err-invalid-input)))
+        (ok true)))
+
+(define-public (certify-item (item-id uint) (certification-type (string-ascii 50)) (authenticity-score uint) 
+                            (condition-verified bool) (value-assessment uint) (notes (string-ascii 300)) (validity-blocks uint))
+    (let ((caller tx-sender)
+          (item (unwrap! (map-get? items item-id) err-not-found))
+          (verifier-data (unwrap! (map-get? verifiers caller) err-not-verifier)))
+        (asserts! (get is-active verifier-data) err-not-verifier)
+        (asserts! (> (len certification-type) u0) err-invalid-input)
+        (asserts! (<= authenticity-score u100) err-invalid-input)
+        (asserts! (> validity-blocks u0) err-invalid-input)
+        
+        (map-set item-certifications item-id {
+            item-id: item-id,
+            verifier: caller,
+            certification-type: certification-type,
+            authenticity-score: authenticity-score,
+            condition-verified: condition-verified,
+            value-assessment: value-assessment,
+            notes: notes,
+            certified-at: stacks-block-height,
+            valid-until: (+ stacks-block-height validity-blocks)
+        })
+        
+        (let ((verifier-history-list (default-to (list) (map-get? verifier-history caller)))
+              (new-action {action: "item-certified", item-id: item-id, block: stacks-block-height}))
+            (map-set verifier-history caller 
+                     (unwrap! (as-max-len? (append verifier-history-list new-action) u100) err-invalid-input)))
+        (ok true)))
+
+(define-public (update-verifier-reputation (verifier principal) (rating uint))
+    (let ((caller tx-sender)
+          (verifier-data (unwrap! (map-get? verifiers verifier) err-not-found))
+          (user-data (unwrap! (map-get? users caller) err-unauthorized)))
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-input)
+        (asserts! (> (get total-trades user-data) u5) err-unauthorized)
+        
+        (let ((current-rep (get reputation-score verifier-data))
+              (verification-count (get verification-count verifier-data)))
+            (if (> verification-count u0)
+                (let ((new-rep (/ (+ (* current-rep verification-count) (* rating u20)) (+ verification-count u1))))
+                    (map-set verifiers verifier (merge verifier-data { reputation-score: new-rep }))
+                    (ok true))
+                (ok true)))))
+
+(define-public (deactivate-verifier)
+    (let ((caller tx-sender)
+          (verifier-data (unwrap! (map-get? verifiers caller) err-not-verifier)))
+        (map-set verifiers caller (merge verifier-data { is-active: false }))
+        (ok true)))
+
+(define-public (challenge-verification (verification-id uint))
+    (let ((verification (unwrap! (map-get? verifications verification-id) err-not-found))
+          (caller tx-sender))
+        (asserts! (is-some (map-get? users caller)) err-unauthorized)
+        (asserts! (is-eq (get status verification) "completed") err-invalid-input)
+        (asserts! (< (- stacks-block-height (unwrap-panic (get completed-at verification))) u144) err-verification-expired)
+        
+        (map-set verifications verification-id (merge verification { status: "challenged" }))
+        (ok true)))
+
+(define-read-only (get-verifier (verifier principal))
+    (map-get? verifiers verifier))
+
+(define-read-only (get-verification (verification-id uint))
+    (map-get? verifications verification-id))
+
+(define-read-only (get-item-certification (item-id uint))
+    (map-get? item-certifications item-id))
+
+(define-read-only (get-user-verifications (user principal))
+    (map-get? user-verifications user))
+
+(define-read-only (get-verifier-history (verifier principal))
+    (map-get? verifier-history verifier))
+
+(define-read-only (get-verification-stats)
+    (ok {
+        total-verifications: (var-get next-verification-id),
+        min-stake: (var-get min-verifier-stake),
+        verification-fee: (var-get verification-fee)
+    }))
+
+(define-read-only (is-item-certified (item-id uint))
+    (let ((certification (map-get? item-certifications item-id)))
+        (if (is-some certification)
+            (> (get valid-until (unwrap-panic certification)) stacks-block-height)
+            false)))
+
+(define-read-only (get-active-verifiers)
+    (ok "use get-verifier with specific principal"))
+
 (define-read-only (get-user (user principal))
     (map-get? users user))
 
@@ -423,3 +663,5 @@
         platform-fee: (var-get platform-fee),
         current-block: stacks-block-height
     }))
+
+
